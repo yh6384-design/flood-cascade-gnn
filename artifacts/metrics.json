@@ -1,0 +1,18 @@
+{
+  "gnn": {
+    "roc_auc": 0.9489856838083945,
+    "pr_auc": 0.9109814013482012,
+    "positive_rate": 0.319698691368103,
+    "secondary_roc_auc": 0.9426973253342518,
+    "secondary_pr_auc": 0.8892958433707934,
+    "secondary_positive_rate": 0.294962614774704
+  },
+  "mlp": {
+    "roc_auc": 0.7749274785960829,
+    "pr_auc": 0.6159478852689377,
+    "positive_rate": 0.319698691368103,
+    "secondary_roc_auc": 0.7471824837323565,
+    "secondary_pr_auc": 0.48572028810243745,
+    "secondary_positive_rate": 0.294962614774704
+  }
+}
