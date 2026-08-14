@@ -274,16 +274,3 @@ python src/train.py --epochs 25 --batch-size 128   # ~2 min
 python src/figures.py
 ```
 
-## References
-
-- IEEE 118-bus test case, via `pandapower.networks`.
-- Dobson, Carreras, Lynch & Newman (2007), *Complex systems analysis of series
-  of blackouts*, Chaos 17(2) — cascading failure as an overload redistribution
-  process.
-- Hines, Cotilla-Sanchez & Blumsack (2010), *Do topological models provide good
-  information about electricity infrastructure vulnerability?*, Chaos 20(3) —
-  the case for flow-based rather than purely topological cascade models.
-- Hamilton, Ying & Leskovec (2017), *Inductive representation learning on large
-  graphs* (GraphSAGE).
-- FEMA National Flood Hazard Layer, for real depth grids.
-
