@@ -287,6 +287,3 @@ python src/figures.py
   graphs* (GraphSAGE).
 - FEMA National Flood Hazard Layer, for real depth grids.
 
-## License
-
-MIT.
