@@ -201,6 +201,38 @@ thermal is exactly the sort of thing this kind of model is for.
 produces a meaningful spread of outcomes rather than a degenerate one.
 
 ---
+## An insurance reading of the same curve
+
+Figure 3 is, in form, exactly what a catastrophe model produces: a distribution
+over outcomes with the tail made explicit. The only thing standing between it and
+a catastrophe *loss* curve is the unit on the x-axis. `src/loss_module.py` takes
+that last step and nothing more, valuing the energy not served in each event at a
+value-of-lost-load rate:
+
+    load shed (MW)  x  outage duration (h)  x  VOLL ($/MWh)  =  event loss ($)
+
+![the exceedance curve, priced](figures/06_loss_curve.png)
+
+At an illustrative \$2,500/MWh, the model's average annual loss is \$192m and its
+1-in-100 event is \$1.2bn. The curve has the same heavy-tailed, multi-modal shape
+as its megawatt twin in figure 3, because it *is* that curve; only the axis has
+changed. Read this way, the simulation is a small catastrophe model for a peril
+conventional flood models do not price: they price the direct property damage at
+the flooded site, not the outage that propagates from it.
+
+And because it is a loss curve, it prices like one. The shaded band is a single
+excess-of-loss layer, \$500m xs \$500m: it attaches in 12% of events, carries a
+ceded AAL of \$27m, and would cost roughly \$44m at a 60% loss ratio. That is the
+whole bridge from the physics to a reinsurance structure, and it fits in a
+paragraph precisely because the hard part, the event set, the cascade, the
+surrogate, was already built above. The trained surrogate inherits it for
+nothing: it predicts the outages, so it can draw this same curve without
+re-running a single cascade.
+
+The dollars are illustrative and scale with the VOLL assumption; the shape, the
+tail, and the fact that the surrogate reproduces them do not. The insurance here
+is a short reading of a technical result, not a second model.
+
 
 ## Limitations
 
