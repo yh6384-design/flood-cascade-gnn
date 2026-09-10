@@ -1,251 +1,150 @@
 """
-From de-energised substations to an insured loss distribution.
+An insurance reading of the simulation: load shed to economic loss.
 
-The simulator (`simulate.py`) answers a physical question: which substations go
-dark in each flood event. This module answers the insurance question sitting on
-top of it: what does that outage cost an insured, and what does the
-distribution of that cost look like across the whole event set.
+The cascade model already produces the object a catastrophe model produces: an
+exceedance curve over outcomes, with the tail made explicit. The only thing
+between that and a catastrophe *loss* curve is the choice of unit. This module
+takes the last small step, valuing the energy not served in each event at a
+value-of-lost-load rate:
 
-The peril modelled here is business interruption (BI) from loss of power, the
-exposure a conventional flood CAT model does not see because it prices direct
-property damage, not network-propagated outage.
+    load shed (MW)  x  outage duration (h)   =  energy not served (MWh)
+    energy not served  x  VOLL ($/MWh)       =  event loss ($)
 
-The chain
----------
-    de-energised bus  ->  daily BI value at risk  ->  outage duration
-        (from Y)          (exposure assumption)      (restoration model)
-        ->  indemnified loss (waiting period, max indemnity period)
-        ->  event loss  ->  event loss table  ->  OEP curve, AAL, PML
-
-Everything downstream of `event_losses` is standard catastrophe-model output,
-just denominated in dollars instead of megawatts.
-
-Insurance mechanics represented
--------------------------------
-* Exposure: each bus carries a daily BI value proportional to its served load
-  (`value_per_mw_day`). A bus only contributes loss in events where it is
-  de-energised.
-* Outage duration: a per-event restoration time, lognormal, with a median that
-  scales with how much of the system went down (a bigger cascade takes longer
-  to restore). Stated as an assumption, not a calibrated figure.
-* Waiting period: a time deductible. Outage shorter than this indemnifies zero.
-* Maximum indemnity period: the policy caps how many days of BI it will pay.
-
-Assumptions and limitations
----------------------------
-* Exposure is synthetic and load-proportional. No real insured-value schedule
-  is used. `value_per_mw_day` is an illustrative rate, tune it to a book.
-* Duration is modelled at the event level, not per bus. A real study would let
-  restoration time vary by asset and by how deep in the cascade a bus sits.
-* One deterministic `value_per_mw_day` and one duration model; no correlation
-  structure beyond what the physical cascade already induces.
-
-The point of the module is the pipeline and the insurance framing, not the
-absolute dollar figures, which are only as good as the exposure assumptions
-fed in.
+That is the whole model. One economic assumption (VOLL) and a restoration-time
+model, both stated here. The absolute dollars scale with VOLL; the shape of the
+curve is the cascade's, unchanged. It exists so the technical result above can
+be read as, and priced like, a catastrophe model, not to be a pricing tool in
+its own right.
 """
 
 from __future__ import annotations
 
 import argparse
-import json
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from pathlib import Path
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 
-
-# ---------------------------------------------------------------------------
-# Parameters
-# ---------------------------------------------------------------------------
-
-@dataclass
-class ExposureParams:
-    value_per_mw_day: float = 120_000.0  # daily BI value at risk per MW of served load
-    # Interpretation: a bus serving 100 MW carries $12.0m/day of BI exposure.
-    # Illustrative; replace with a real value-per-MW derived from the book.
+NAVY = "#1F3864"
+RED = "#B23A48"
+BLUE = "#4C72B0"
 
 
 @dataclass
-class DurationParams:
-    median_days_min: float = 1.0    # restoration time for the smallest cascade
-    median_days_max: float = 21.0   # restoration time when ~all load is down
-    sigma_ln: float = 0.5           # lognormal shape (spread of restoration time)
+class Assumptions:
+    voll_per_mwh: float = 2_500.0     # value of lost load; illustrative
+    restore_min_h: float = 3.0        # restoration time for the smallest cascade
+    restore_max_h: float = 96.0       # restoration time when ~all load is down
+    sigma_ln: float = 0.5             # lognormal spread of restoration time
 
 
-@dataclass
-class PolicyTerms:
-    waiting_period_days: float = 1.0        # time deductible
-    max_indemnity_days: float = 30.0        # BI cap
+def outage_duration_h(outage_frac, rng, a: Assumptions):
+    """Per-event restoration time (hours), lognormal, longer for bigger cascades."""
+    med = a.restore_min_h + (a.restore_max_h - a.restore_min_h) * np.clip(outage_frac, 0, 1)
+    return rng.lognormal(mean=np.log(np.maximum(med, 1e-6)), sigma=a.sigma_ln)
 
 
-# ---------------------------------------------------------------------------
-# Core
-# ---------------------------------------------------------------------------
-
-def bus_daily_value(bus_load_mw: np.ndarray, exp: ExposureParams) -> np.ndarray:
-    """Per-bus daily BI value at risk (n_bus,)."""
-    return bus_load_mw.astype(float) * exp.value_per_mw_day
+def event_losses(load_shed_mw, duration_h, a: Assumptions):
+    """Economic loss per event: energy not served, valued at VOLL."""
+    energy_not_served_mwh = np.asarray(load_shed_mw, float) * duration_h
+    return energy_not_served_mwh * a.voll_per_mwh
 
 
-def event_durations(
-    outage_frac: np.ndarray, rng: np.random.Generator, dur: DurationParams
-) -> np.ndarray:
-    """
-    Draw a restoration time (days) for each event.
-
-    The lognormal median is interpolated between `median_days_min` and
-    `median_days_max` by the fraction of system load that ended up down, so a
-    near-total blackout takes materially longer to restore than a local outage.
-    """
-    med = dur.median_days_min + (dur.median_days_max - dur.median_days_min) * np.clip(
-        outage_frac, 0.0, 1.0
-    )
-    # lognormal with the given median (median = exp(mu)) and shape sigma_ln
-    mu = np.log(np.maximum(med, 1e-6))
-    return rng.lognormal(mean=mu, sigma=dur.sigma_ln)
+def ep_curve(losses):
+    s = np.sort(losses)[::-1]
+    return s, np.arange(1, len(s) + 1) / (len(s) + 1)
 
 
-def indemnified_days(duration_days: np.ndarray, pol: PolicyTerms) -> np.ndarray:
-    """Apply waiting period and max indemnity period to a duration."""
-    payable = np.clip(duration_days - pol.waiting_period_days, 0.0, None)
-    return np.minimum(payable, pol.max_indemnity_days)
+def pml(losses, return_period):
+    s, ep = ep_curve(losses)
+    return float(s[min(np.searchsorted(ep, 1.0 / return_period), len(s) - 1)])
 
 
-def event_losses(
-    energised_state,
-    bus_load_mw: np.ndarray,
-    durations_days: np.ndarray,
-    exp: ExposureParams,
-    pol: PolicyTerms,
-) -> np.ndarray:
-    """
-    Ground-up insured BI loss per event (n_events,).
-
-    `energised_state` is (n_events, n_bus). It can be either:
-      * hard 0/1 labels (the simulator's Y, or a surrogate's thresholded
-        prediction), or
-      * probabilities in [0, 1] (a surrogate's raw output), in which case the
-        loss is the expected loss under those probabilities.
-    Passing probabilities is what lets the trained GNN price the book directly,
-    without re-running the physical cascade for every scenario.
-    """
-    state = np.asarray(energised_state, dtype=float)          # (E, B)
-    daily = bus_daily_value(bus_load_mw, exp)                 # (B,)
-    ind_days = indemnified_days(durations_days, pol)          # (E,)
-    # loss = sum_b [ down_b * daily_value_b ] * indemnified_days_event
-    per_event_daily_value = state @ daily                     # (E,)
-    return per_event_daily_value * ind_days
-
-
-# ---------------------------------------------------------------------------
-# Catastrophe-model summaries
-# ---------------------------------------------------------------------------
-
-def oep_curve(event_loss: np.ndarray):
-    """
-    Occurrence exceedance probability curve.
-
-    Returns (loss_sorted_desc, exceedance_prob). With one modelled occurrence
-    per event, the annual OEP and the per-event exceedance coincide here; a
-    multi-event-year model would group by year first.
-    """
-    losses = np.sort(event_loss)[::-1]
-    n = len(losses)
-    exceed = (np.arange(1, n + 1)) / (n + 1)
-    return losses, exceed
-
-
-def pml_at(event_loss: np.ndarray, return_periods=(100, 250)) -> dict:
-    """PML (loss) at the given return periods, read off the OEP curve."""
-    losses, exceed = oep_curve(event_loss)
-    out = {}
-    for rp in return_periods:
-        target = 1.0 / rp
-        # first loss whose exceedance probability is <= target
-        idx = np.searchsorted(exceed, target)
-        idx = min(idx, len(losses) - 1)
-        out[f"pml_{rp}yr"] = float(losses[idx])
-    return out
-
-
-def loss_metrics(event_loss: np.ndarray, return_periods=(100, 250)) -> dict:
-    aal = float(event_loss.mean())
-    sd = float(event_loss.std())
-    m = {
-        "events": int(len(event_loss)),
-        "aal": aal,
-        "loss_sd": sd,
-        "loss_cov": float(sd / aal) if aal > 0 else float("nan"),
-        "mean_loss_given_event": float(event_loss[event_loss > 0].mean())
-        if (event_loss > 0).any()
-        else 0.0,
-        "prob_nonzero": float((event_loss > 0).mean()),
+def metrics(losses):
+    return {
+        "aal": float(losses.mean()),
+        "pml_100yr": pml(losses, 100),
+        "pml_250yr": pml(losses, 250),
+        "cov": float(losses.std() / losses.mean()) if losses.mean() else float("nan"),
     }
-    m.update(pml_at(event_loss, return_periods))
-    return m
 
 
-# ---------------------------------------------------------------------------
-# Driver
-# ---------------------------------------------------------------------------
+def price_layer(losses, attachment, limit, target_lr=0.60):
+    """One illustrative excess-of-loss layer, priced on a burning-cost basis."""
+    ceded = np.clip(losses - attachment, 0.0, limit)
+    ceded_aal = float(ceded.mean())
+    return {
+        "attachment": attachment,
+        "limit": limit,
+        "prob_attach": float((ceded > 0).mean()),
+        "ceded_aal": ceded_aal,
+        "premium_60lr": ceded_aal / target_lr,
+    }
 
-def losses_from_scenarios(
-    npz_path: Path,
-    exp: ExposureParams,
-    dur: DurationParams,
-    pol: PolicyTerms,
-    seed: int = 7,
-    use_probabilities: np.ndarray | None = None,
-) -> np.ndarray:
+
+def losses_from_scenarios(npz_path, a: Assumptions, seed=7, load_shed_override=None):
     """
-    Load a scenario set and return the per-event insured loss array.
+    Per-event economic loss from a scenario set.
 
-    If `use_probabilities` is given (n_events, n_bus), losses are computed from
-    it (the surrogate path). Otherwise the simulator's hard Y labels are used.
+    `load_shed_override` lets the trained surrogate stand in for the simulator:
+    pass its predicted load-shed-per-event and the same loss curve comes out with
+    no cascade re-run.
     """
     d = np.load(npz_path, allow_pickle=True)
-    Y = d["Y"]
-    bus_load_mw = d["bus_load_mw"]
-    load_shed_mw = d["meta"][:, list(d["meta_cols"]).index("load_shed_mw")]
-    outage_frac = load_shed_mw / bus_load_mw.sum()
-
+    total = d["bus_load_mw"].sum()
+    load_shed = load_shed_override if load_shed_override is not None \
+        else d["meta"][:, list(d["meta_cols"]).index("load_shed_mw")]
     rng = np.random.default_rng(seed)
-    durations = event_durations(outage_frac, rng, dur)
-
-    state = use_probabilities if use_probabilities is not None else Y
-    return event_losses(state, bus_load_mw, durations, exp, pol)
+    dur = outage_duration_h(load_shed / total, rng, a)
+    return event_losses(load_shed, dur, a)
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser(description="Insured BI loss from the flood-cascade scenario set.")
+def fig_loss_curve(losses, layer, out: Path):
+    s, ep = ep_curve(losses)
+    fig, ax = plt.subplots(figsize=(8.0, 5.0))
+    ax.plot(s / 1e6, ep, color=NAVY, lw=2)
+    ax.set_yscale("log")
+    ax.set_xlabel("event loss ($m)")
+    ax.set_ylabel("P(exceedance) per event")
+    ax.set_title("The exceedance curve, priced")
+    ax.grid(alpha=0.3, which="both")
+    if layer is not None:
+        ax.axvspan(layer["attachment"] / 1e6, (layer["attachment"] + layer["limit"]) / 1e6,
+                   color=BLUE, alpha=0.14,
+                   label="XL layer \\${:.0f}m xs \\${:.0f}m".format(layer["limit"]/1e6, layer["attachment"]/1e6))
+    for rp, style in ((100, "--"), (250, "-.")):
+        v = pml(losses, rp)
+        ax.axvline(v / 1e6, color=RED, ls=style, lw=1.1, label="1-in-{}: \\${:,.0f}m".format(rp, v/1e6))
+    ax.legend(fontsize=8)
+    fig.tight_layout(); out.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out, dpi=130, bbox_inches="tight"); plt.close(fig)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Economic-loss reading of the flood-cascade scenarios.")
     ap.add_argument("--scenarios", type=Path, default=Path("data/scenarios.npz"))
-    ap.add_argument("--value-per-mw-day", type=float, default=ExposureParams.value_per_mw_day)
-    ap.add_argument("--waiting-days", type=float, default=PolicyTerms.waiting_period_days)
-    ap.add_argument("--max-indemnity-days", type=float, default=PolicyTerms.max_indemnity_days)
-    ap.add_argument("--seed", type=int, default=7)
-    ap.add_argument("--out", type=Path, default=Path("artifacts/event_losses.npy"))
+    ap.add_argument("--voll", type=float, default=Assumptions.voll_per_mwh)
+    ap.add_argument("--attachment", type=float, default=400e6)
+    ap.add_argument("--limit", type=float, default=400e6)
+    ap.add_argument("--fig", type=Path, default=Path("figures/06_loss_curve.png"))
     args = ap.parse_args()
 
-    exp = ExposureParams(value_per_mw_day=args.value_per_mw_day)
-    dur = DurationParams()
-    pol = PolicyTerms(waiting_period_days=args.waiting_days, max_indemnity_days=args.max_indemnity_days)
+    a = Assumptions(voll_per_mwh=args.voll)
+    losses = losses_from_scenarios(args.scenarios, a)
+    m = metrics(losses)
+    layer = price_layer(losses, args.attachment, args.limit)
+    fig_loss_curve(losses, layer, args.fig)
 
-    event_loss = losses_from_scenarios(args.scenarios, exp, dur, pol, seed=args.seed)
-    metrics = loss_metrics(event_loss)
-
-    args.out.parent.mkdir(parents=True, exist_ok=True)
-    np.save(args.out, event_loss)
-    summary = {"assumptions": {**asdict(exp), **asdict(dur), **asdict(pol)}, "metrics": metrics}
-    (args.out.parent / "loss_summary.json").write_text(json.dumps(summary, indent=2))
-
-    print("insured BI loss summary  (illustrative exposure)")
-    for k, v in metrics.items():
-        if isinstance(v, float) and abs(v) >= 1000:
-            print(f"  {k:24s} {v:,.0f}")
-        else:
-            print(f"  {k:24s} {v}")
-    print(f"\nwrote {args.out} and loss_summary.json")
+    print("economic loss  (illustrative VOLL = ${:,.0f}/MWh)".format(a.voll_per_mwh))
+    for k, v in m.items():
+        print("  {:12s} {:,.0f}".format(k, v) if abs(v) >= 100 else "  {:12s} {:.2f}".format(k, v))
+    print("\nlayer ${:.0f}m xs ${:.0f}m:  attaches {:.0f}% of events,  ceded AAL ${:.0f}m,  premium ${:.0f}m at 60% LR".format(
+        layer["limit"]/1e6, layer["attachment"]/1e6, layer["prob_attach"]*100,
+        layer["ceded_aal"]/1e6, layer["premium_60lr"]/1e6))
+    print("wrote", args.fig)
 
 
 if __name__ == "__main__":
